@@ -89,6 +89,7 @@ Typical setup:
 
 - ESP32-S3 4.3" Touch Display
 - ESP32-C3 module (RS485)
+- I2C FRAM module (for persistent runtime and system data storage)
 - RS485 relay board (Modbus)
 - MAX3485 TTL to RS485 interface module
 - RS485 analog acquisition module (for pressure and TDS)
