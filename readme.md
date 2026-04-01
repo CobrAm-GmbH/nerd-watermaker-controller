@@ -100,9 +100,9 @@ Typical setup:
 
 ## Firmware Structure
 
-firmware/
-  S3_Controller/
-  C3_Module/
+    firmware/
+      S3_Controller/
+      C3_Module/
 
 ---
 
