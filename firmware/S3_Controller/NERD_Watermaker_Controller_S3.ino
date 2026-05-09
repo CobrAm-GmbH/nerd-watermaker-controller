@@ -7,6 +7,7 @@
 #include <HardwareSerial.h>
 #include <driver/i2c.h>
 #include <esp_err.h>
+#include <stdarg.h>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -31,6 +32,33 @@ static const int ARROW_RIGHT_Y = 20;
 // --------------------------------------------------
 // GLOBAL STATE / CONFIG
 // --------------------------------------------------
+
+static const char *SW_VERSION = "N.E.R.D. v1.1.0";
+
+// --------------------------------------------------
+// v1.1.0 Stability Update
+// --------------------------------------------------
+//
+// Main fixes:
+// - RS485 UART initialized once only
+// - RX buffer flushed before Modbus reads
+// - Reduced blocking serial polling
+// - Improved main loop timing
+// - GUI update throttling added
+// - Debug screen updates limited
+// - I2C bus speed reduced from 400kHz to 100kHz
+//   for improved GT911 touch stability
+//
+// Result:
+// - Prevents random ESP32-S3 resets / INT_WDT
+// - Greatly improves RS485 stability
+// - System remains operational during GT911 I2C errors
+//
+// Notes:
+// - GT911 touch I2C errors may still occur sporadically
+// - Controller logic and outputs continue running normally
+// --------------------------------------------------
+
 static bool prepumpOn = false;
 static bool hppumpOn = false;
 static bool flushOn = false;
@@ -41,6 +69,20 @@ static bool cmdHppumpToggle = false;
 static bool cmdFlushToggle = false;
 static bool cmdTankToggle = false;
 static bool cmdFaultReset = false;
+
+static bool autoProductionEnabled = false;
+static bool autoProductionModeTime = true;   // true = TIME, false = LITERS
+
+static bool autoProductionActive = false;
+
+static uint32_t autoProductionStartRuntimeSec = 0;
+static uint32_t autoProductionTargetRuntimeSec = 0;
+
+static uint32_t autoProductionStartLiters_x10 = 0;
+static uint32_t autoProductionTargetLiters_x10 = 0;
+
+static int autoProductionTimeHours = 1;      // 1..5
+static int autoProductionTargetLiters = 50; // 50..500 step 50
 
 static bool flushCycleActive = false;
 static unsigned long flushStartMs = 0;
@@ -56,11 +98,42 @@ static bool framReady = false;
 static bool framInitTried = false;
 static unsigned long framInitEarliestMs = 0;
 
+// --- DEBUG PERSISTENT ---
+static uint32_t debugBootCount = 0;
+static uint32_t debugLastResetReason = 0;
+static uint32_t debugHeartbeatCount = 0;
+static uint32_t debugLastUptimeSec = 0;
+
+static unsigned long lastPersistentHeartbeatSaveMs = 0;
+
+// --- DEBUG RING BUFFER (RAM ONLY) ---
+static const int DEBUG_LOG_LINES = 10;
+static const int DEBUG_LOG_LINE_LEN = 96;
+
+static char debugLogBuffer[DEBUG_LOG_LINES][DEBUG_LOG_LINE_LEN];
+static int debugLogWriteIndex = 0;
+static bool debugLogWrapped = false;
+
+// --- BOOT LOG BUFFER (RAM ONLY) ---
+static const int BOOT_LOG_LINES = 30;
+static const int BOOT_LOG_LINE_LEN = 96;
+
+static char bootLogBuffer[BOOT_LOG_LINES][BOOT_LOG_LINE_LEN];
+static int bootLogWriteIndex = 0;
+static bool bootLogWrapped = false;
 
 static unsigned long lastHppumpSecondTick = 0;
 static bool runtimeSavePending = false;
 static unsigned long runtimeSaveDueMs = 0;
 static uint32_t lastDisplayedHoursSec = 0xFFFFFFFFUL;
+
+
+static uint32_t totalProducedLiters_x10 = 0;
+static unsigned long lastLitersSecondTick = 0;
+static bool litersSavePending = false;
+static unsigned long litersSaveDueMs = 0;
+static uint32_t lastDisplayedLitersInt = 0xFFFFFFFFUL;
+static float litersFractionAcc = 0.0f;
 
 // --------------------
 // USER PIN MAPPING / BOARD BUS MAP
@@ -78,6 +151,11 @@ static const int PIN_FLOW_SENSOR = 4;
 static const i2c_port_t FRAM_I2C_PORT = I2C_NUM_0;
 static const uint8_t FRAM_I2C_ADDR = 0x50;
 static const uint16_t FRAM_ADDR_HPPUMP_RUNTIME = 0x0000;
+static const uint16_t FRAM_ADDR_TOTAL_LITERS_X10 = 0x0004;
+static const uint16_t FRAM_ADDR_DEBUG_BOOT_COUNT       = 0x0008;
+static const uint16_t FRAM_ADDR_DEBUG_LAST_RESET       = 0x000C;
+static const uint16_t FRAM_ADDR_DEBUG_HEARTBEAT_COUNT  = 0x0010;
+static const uint16_t FRAM_ADDR_DEBUG_LAST_UPTIME_SEC  = 0x0014;
 
 // --------------------
 // SHARED RS485 MODBUS BUS
@@ -190,11 +268,13 @@ static const lv_color_t COL_GREEN     = lv_color_hex(0x18B000);
 static lv_obj_t *screenMain = nullptr;
 static lv_obj_t *screenSettings = nullptr;
 static lv_obj_t *screenAlarm = nullptr;
+static lv_obj_t *screenProduction = nullptr;
+static lv_obj_t *screenDebug = nullptr;
 
 // Bottom buttons per screen [screen][button]
-static lv_obj_t *btns[2][4] = {{nullptr}};
-static lv_obj_t *btnIcons[2][4] = {{nullptr}};
-static lv_obj_t *btnLabels[2][4] = {{nullptr}};
+static lv_obj_t *btns[4][4] = {{nullptr}};
+static lv_obj_t *btnIcons[4][4] = {{nullptr}};
+static lv_obj_t *btnLabels[4][4] = {{nullptr}};
 
 // Gentle backgrounds behind gauges
 static lv_obj_t *gaugeBgPressure = nullptr;
@@ -237,6 +317,7 @@ static lv_obj_t *panelTrim  = nullptr;
 
 static lv_obj_t *lblHoursValue = nullptr;
 static lv_obj_t *spinnerHours = nullptr;
+static lv_obj_t *lblLitersValue = nullptr;
 
 static lv_obj_t *rollerFlushTime = nullptr;
 
@@ -249,6 +330,36 @@ static lv_obj_t *alarmLed = nullptr;
 static lv_obj_t *lblAlarmStatus = nullptr;
 static lv_obj_t *lblFaultTitle = nullptr;
 static lv_obj_t *lblFaultMessage = nullptr;
+
+// Production screen center panels
+static lv_obj_t *panelProdEnable = nullptr;
+static lv_obj_t *panelProdMode   = nullptr;
+static lv_obj_t *panelProdTarget = nullptr;
+
+static lv_obj_t *btnProdEnable = nullptr;
+static lv_obj_t *lblProdEnableValue = nullptr;
+static lv_obj_t *btnProdStart = nullptr;
+
+static lv_obj_t *btnModeTime = nullptr;
+static lv_obj_t *btnModeLiters = nullptr;
+static lv_obj_t *lblProdModeValue = nullptr;
+
+static lv_obj_t *btnTargetMinus = nullptr;
+static lv_obj_t *btnTargetPlus = nullptr;
+static lv_obj_t *lblProdTargetValue = nullptr;
+static lv_obj_t *lblProdCountdown = nullptr;
+
+// Debug screen panels
+static lv_obj_t *panelDebugSystem = nullptr;
+static lv_obj_t *panelDebugMemory = nullptr;
+static lv_obj_t *panelDebugEvents = nullptr;
+
+static lv_obj_t *lblDebugSystemValue = nullptr;
+static lv_obj_t *lblDebugMemoryValue = nullptr;
+static lv_obj_t *lblDebugEventsValue = nullptr;
+
+static lv_obj_t *panelBootLog = nullptr;
+static lv_obj_t *lblBootLogValue = nullptr;
 
 // --------------------------------------------------
 // FORWARD DECLARATIONS
@@ -263,6 +374,37 @@ static void process_pending_runtime_save();
 static void apply_outputs();
 static void safe_shutdown_outputs();
 static void update_flow_sensor_selector_panel();
+static void schedule_liters_save(uint32_t delayMs);
+static void process_pending_liters_save();
+static void update_total_liters();
+static void update_liters_label();
+static void show_production_screen();
+static void create_production_screen();
+
+static void show_debug_screen();
+static void create_debug_screen();
+static void update_debug_screen();
+
+static void boot_log(const char *msg);
+static void boot_logf(const char *fmt, ...);
+
+static void update_production_screen_visuals();
+static void prod_start_cb(lv_event_t *e);
+static void prod_enable_cb(lv_event_t *e);
+static void prod_mode_time_cb(lv_event_t *e);
+static void prod_mode_liters_cb(lv_event_t *e);
+static void prod_target_minus_cb(lv_event_t *e);
+static void prod_target_plus_cb(lv_event_t *e);
+static void process_auto_production_logic();
+
+static void debug_load_persistent_info();
+static void debug_save_boot_info();
+static void debug_save_heartbeat_persistent();
+static const char* reset_reason_to_string(esp_reset_reason_t reason);
+static void debug_print_boot_report();
+
+static void debug_log(const char *msg);
+static void debug_logf(const char *fmt, ...);
 
 // --------------------------------------------------
 // HELPERS
@@ -564,13 +706,197 @@ static void fram_try_init_deferred()
     framReady = fram_probe();
 
     if (framReady) {
+    debug_log("FRAM READY");
+    boot_log("FRAM READY");
+} else {
+    debug_log("FRAM FAIL");
+    boot_log("FRAM FAIL");
+}
+
+    if (framReady) {
         uint32_t storedRuntime = 0;
         if (fram_read_u32(FRAM_ADDR_HPPUMP_RUNTIME, &storedRuntime)) {
             hppumpRuntimeSec = storedRuntime;
         } else {
             framReady = false;
         }
+
+        if (framReady) {
+            uint32_t storedLiters_x10 = 0;
+            if (fram_read_u32(FRAM_ADDR_TOTAL_LITERS_X10, &storedLiters_x10)) {
+                totalProducedLiters_x10 = storedLiters_x10;
+            } else {
+                framReady = false;
+            }
+        }
+
+        if (framReady) {
+            debug_load_persistent_info();
+            debug_save_boot_info();
+            debug_print_boot_report();
+        }
     }
+}
+
+static const char* reset_reason_to_string(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_UNKNOWN:   return "UNKNOWN";
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXTERNAL";
+        case ESP_RST_SW:        return "SOFTWARE";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "OTHER";
+    }
+}
+
+static void debug_load_persistent_info()
+{
+    if (!framReady) return;
+
+    fram_read_u32(FRAM_ADDR_DEBUG_BOOT_COUNT,      &debugBootCount);
+    fram_read_u32(FRAM_ADDR_DEBUG_LAST_RESET,      &debugLastResetReason);
+    fram_read_u32(FRAM_ADDR_DEBUG_HEARTBEAT_COUNT, &debugHeartbeatCount);
+    fram_read_u32(FRAM_ADDR_DEBUG_LAST_UPTIME_SEC, &debugLastUptimeSec);
+
+    // Se i dati sono chiaramente sporchi / non inizializzati, li azzeriamo
+    if (debugBootCount > 1000000UL ||
+        debugHeartbeatCount > 1000000UL ||
+        debugLastUptimeSec > 31536000UL)   // > 1 anno di uptime non ha senso
+    {
+        debugBootCount = 0;
+        debugLastResetReason = 0;
+        debugHeartbeatCount = 0;
+        debugLastUptimeSec = 0;
+
+        fram_write_u32(FRAM_ADDR_DEBUG_BOOT_COUNT,      debugBootCount);
+        fram_write_u32(FRAM_ADDR_DEBUG_LAST_RESET,      debugLastResetReason);
+        fram_write_u32(FRAM_ADDR_DEBUG_HEARTBEAT_COUNT, debugHeartbeatCount);
+        fram_write_u32(FRAM_ADDR_DEBUG_LAST_UPTIME_SEC, debugLastUptimeSec);
+    }
+}
+
+static void debug_save_boot_info()
+{
+    if (!framReady) return;
+
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    debugBootCount++;
+    debugLastResetReason = (uint32_t)reason;
+
+    fram_write_u32(FRAM_ADDR_DEBUG_BOOT_COUNT, debugBootCount);
+    fram_write_u32(FRAM_ADDR_DEBUG_LAST_RESET, debugLastResetReason);
+}
+
+static void debug_save_heartbeat_persistent()
+{
+    if (!framReady) return;
+
+    unsigned long now = millis();
+    if ((now - lastPersistentHeartbeatSaveMs) < 60000UL) return;
+    lastPersistentHeartbeatSaveMs = now;
+
+    debugHeartbeatCount++;
+    debugLastUptimeSec = now / 1000UL;
+
+    fram_write_u32(FRAM_ADDR_DEBUG_HEARTBEAT_COUNT, debugHeartbeatCount);
+    fram_write_u32(FRAM_ADDR_DEBUG_LAST_UPTIME_SEC, debugLastUptimeSec);
+}
+
+static void debug_print_boot_report()
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("N.E.R.D. PERSISTENT DEBUG REPORT");
+    Serial.printf("Current reset reason: %s (%d)\n",
+              reset_reason_to_string(reason),
+              (int)reason);
+    Serial.printf("Persistent boot count: %lu\n", (unsigned long)debugBootCount);
+    Serial.printf("Persistent last reset reason: %s (%lu)\n",
+              reset_reason_to_string((esp_reset_reason_t)debugLastResetReason),
+              (unsigned long)debugLastResetReason);
+    Serial.printf("Persistent heartbeat count: %lu\n", (unsigned long)debugHeartbeatCount);
+    Serial.printf("Persistent last uptime: %lu s\n", (unsigned long)debugLastUptimeSec);
+    Serial.printf("Free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("Free PSRAM: %lu bytes\n", (unsigned long)ESP.getFreePsram());
+    Serial.println("========================================");
+    Serial.println();
+    debug_log("BOOT READY");
+    boot_logf("RESET: %s (%d)", reset_reason_to_string(reason), (int)reason);
+boot_log("BOOT READY");
+}
+
+static void debug_log(const char *msg)
+{
+    if (!msg) return;
+
+    snprintf(debugLogBuffer[debugLogWriteIndex],
+             DEBUG_LOG_LINE_LEN,
+             "%s",
+             msg);
+
+    debugLogWriteIndex++;
+    if (debugLogWriteIndex >= DEBUG_LOG_LINES) {
+        debugLogWriteIndex = 0;
+        debugLogWrapped = true;
+    }
+
+    Serial.printf("[DBG] %s\n", msg);
+}
+
+static void debug_logf(const char *fmt, ...)
+{
+    if (!fmt) return;
+
+    char temp[DEBUG_LOG_LINE_LEN];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(temp, sizeof(temp), fmt, args);
+    va_end(args);
+
+    debug_log(temp);
+}
+
+static void boot_log(const char *msg)
+{
+    if (!msg) return;
+
+    snprintf(bootLogBuffer[bootLogWriteIndex],
+             BOOT_LOG_LINE_LEN,
+             "%s",
+             msg);
+
+    bootLogWriteIndex++;
+    if (bootLogWriteIndex >= BOOT_LOG_LINES) {
+        bootLogWriteIndex = 0;
+        bootLogWrapped = true;
+    }
+
+    Serial.printf("[BOOT] %s\n", msg);
+}
+
+static void boot_logf(const char *fmt, ...)
+{
+    if (!fmt) return;
+
+    char temp[BOOT_LOG_LINE_LEN];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(temp, sizeof(temp), fmt, args);
+    va_end(args);
+
+    boot_log(temp);
 }
 
 static uint16_t modbus_crc16(const uint8_t *data, size_t len)
@@ -726,18 +1052,19 @@ static bool modbus_force_all_relays_off(uint8_t devAddr)
 // --------------------------------------------------
 static void rs485_begin_fresh()
 {
-    // Stop UART
-    ModbusSerial.end();
-    delay(20);
+    static bool rs485Started = false;
 
-    // Restart UART
-    ModbusSerial.begin(RS485_BAUD, SERIAL_8N1, RS485_UART_RX_PIN, RS485_UART_TX_PIN);
-    ModbusSerial.setRxBufferSize(256);
+    if (!rs485Started) {
+        ModbusSerial.end();
+        delay(20);
 
-    // Allow hardware to settle
-    delay(50);
+        ModbusSerial.begin(RS485_BAUD, SERIAL_8N1, RS485_UART_RX_PIN, RS485_UART_TX_PIN);
+        ModbusSerial.setRxBufferSize(256);
 
-    // Flush any garbage in RX buffer
+        delay(50);
+        rs485Started = true;
+    }
+
     while (ModbusSerial.available()) {
         ModbusSerial.read();
     }
@@ -873,12 +1200,15 @@ static void apply_outputs()
 
 static void safe_shutdown_outputs()
 {
+    debug_log("SAFE SHUTDOWN");
     prepumpOn = false;
     hppumpOn = false;
     flushOn = false;
     flushCycleActive = false;
+    autoProductionActive = false;
     relay_all_off();
     schedule_runtime_save(300UL);
+    schedule_liters_save(300UL);
 }
 
 
@@ -891,13 +1221,43 @@ static void nav_to_settings_cb(lv_event_t *e)
     show_settings_screen();
 }
 
+static void nav_to_production_cb(lv_event_t *e)
+{
+    (void)e;
+    show_production_screen();
+}
+
 static void nav_to_main_cb(lv_event_t *e)
 {
     (void)e;
     show_main_screen();
 }
 
-static lv_obj_t *create_header(lv_obj_t *parent, bool leftArrow, bool rightArrow)
+static void nav_to_settings_from_production_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void nav_to_debug_cb(lv_event_t *e)
+{
+    (void)e;
+    show_debug_screen();
+}
+
+static void nav_to_production_from_debug_cb(lv_event_t *e)
+{
+    (void)e;
+    show_production_screen();
+}
+
+static lv_obj_t *create_header(
+    lv_obj_t *parent,
+    bool leftArrow,
+    bool rightArrow,
+    lv_event_cb_t leftCb,
+    lv_event_cb_t rightCb
+)
 {
     lv_obj_t *top = lv_obj_create(parent);
     lv_obj_set_size(top, 800, 60);
@@ -908,8 +1268,6 @@ static lv_obj_t *create_header(lv_obj_t *parent, bool leftArrow, bool rightArrow
     lv_obj_set_style_border_width(top, 0, 0);
     lv_obj_set_style_radius(top, 0, 0);
     lv_obj_set_style_pad_all(top, 0, 0);
-    lv_obj_set_style_pad_row(top, 0, 0);
-    lv_obj_set_style_pad_column(top, 0, 0);
     lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(top);
@@ -924,10 +1282,11 @@ static lv_obj_t *create_header(lv_obj_t *parent, bool leftArrow, bool rightArrow
         lv_obj_set_size(btn, 60, 60);
         lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_set_style_radius(btn, 0, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(btn, nav_to_main_cb, LV_EVENT_CLICKED, NULL);
+
+        if (leftCb) {
+            lv_obj_add_event_cb(btn, leftCb, LV_EVENT_CLICKED, NULL);
+        }
 
         lv_obj_t *lbl = lv_label_create(top);
         lv_label_set_text(lbl, LV_SYMBOL_LEFT);
@@ -943,10 +1302,11 @@ static lv_obj_t *create_header(lv_obj_t *parent, bool leftArrow, bool rightArrow
         lv_obj_set_size(btn, 60, 60);
         lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_set_style_radius(btn, 0, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(btn, nav_to_settings_cb, LV_EVENT_CLICKED, NULL);
+
+        if (rightCb) {
+            lv_obj_add_event_cb(btn, rightCb, LV_EVENT_CLICKED, NULL);
+        }
 
         lv_obj_t *lbl = lv_label_create(top);
         lv_label_set_text(lbl, LV_SYMBOL_RIGHT);
@@ -1002,11 +1362,109 @@ static void update_flow_sensor_selector_panel()
     }
 }
 
+static void update_production_screen_visuals()
+{
+    if (btnProdEnable) {
+        style_button(btnProdEnable, autoProductionEnabled ? COL_BTN_ON : COL_BTN_OFF);
+    }
+
+    if (btnProdStart) {
+        // --- Stato visuale bottone ---
+        if (!autoProductionEnabled || !hppumpOn) {
+            style_button(btnProdStart, COL_BTN_OFF);
+            lv_obj_set_style_bg_opa(btnProdStart, LV_OPA_50, 0);
+        } else if (autoProductionActive) {
+            style_button(btnProdStart, COL_BTN_ON);
+            lv_obj_set_style_bg_opa(btnProdStart, LV_OPA_COVER, 0);
+        } else {
+            style_button(btnProdStart, COL_BTN_TEST);
+            lv_obj_set_style_bg_opa(btnProdStart, LV_OPA_COVER, 0);
+        }
+
+        // --- Testo START / STOP ---
+        lv_obj_t *child = lv_obj_get_child(btnProdStart, 0);
+        if (child) {
+            if (autoProductionActive) {
+                lv_label_set_text(child, "STOP AUTO");
+            } else {
+                lv_label_set_text(child, "START AUTO");
+            }
+        }
+    }
+
+    if (lblProdEnableValue) {
+        if (!autoProductionEnabled) {
+            lv_label_set_text(lblProdEnableValue, "DISABLED");
+        } else if (autoProductionActive) {
+            lv_label_set_text(lblProdEnableValue, "RUNNING");
+        } else {
+            lv_label_set_text(lblProdEnableValue, "READY");
+        }
+    }
+
+    if (btnModeTime) {
+        style_button(btnModeTime, autoProductionModeTime ? COL_BTN_ON : COL_BTN_OFF);
+    }
+
+    if (btnModeLiters) {
+        style_button(btnModeLiters, autoProductionModeTime ? COL_BTN_OFF : COL_BTN_ON);
+    }
+
+    if (lblProdModeValue) {
+        lv_label_set_text(lblProdModeValue, autoProductionModeTime ? "TIME MODE" : "LITERS MODE");
+    }
+
+    if (lblProdTargetValue) {
+        if (autoProductionModeTime) {
+            lv_label_set_text_fmt(lblProdTargetValue, "%d HOUR%s",
+                                  autoProductionTimeHours,
+                                  (autoProductionTimeHours == 1) ? "" : "S");
+        } else {
+            lv_label_set_text_fmt(lblProdTargetValue, "%d L", autoProductionTargetLiters);
+        }
+    }
+
+    if (lblProdCountdown) {
+        if (!autoProductionActive) {
+            if (autoProductionModeTime) {
+                lv_label_set_text(lblProdCountdown, "TTG --:--:--");
+            } else {
+                lv_label_set_text(lblProdCountdown, "LTG --- L");
+            }
+        } else {
+            if (autoProductionModeTime) {
+                uint32_t remainingSec = 0;
+                if (autoProductionTargetRuntimeSec > hppumpRuntimeSec) {
+                    remainingSec = autoProductionTargetRuntimeSec - hppumpRuntimeSec;
+                }
+
+                uint32_t hh = remainingSec / 3600UL;
+                uint32_t mm = (remainingSec % 3600UL) / 60UL;
+                uint32_t ss = remainingSec % 60UL;
+
+                lv_label_set_text_fmt(lblProdCountdown, "TTG %02lu:%02lu:%02lu",
+                                      (unsigned long)hh,
+                                      (unsigned long)mm,
+                                      (unsigned long)ss);
+            } else {
+                uint32_t remaining_x10 = 0;
+                if (autoProductionTargetLiters_x10 > totalProducedLiters_x10) {
+                    remaining_x10 = autoProductionTargetLiters_x10 - totalProducedLiters_x10;
+                }
+
+                uint32_t remainingLiters = remaining_x10 / 10UL;
+                lv_label_set_text_fmt(lblProdCountdown, "LTG %lu L",
+                                      (unsigned long)remainingLiters);
+            }
+        }
+    }
+}
+
 static void update_all_button_visuals()
 {
     bool outputsLocked = faultLatched;
 
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < 4; s++) {
         if (btns[s][BTN_FEED]) {
             style_button(btns[s][BTN_FEED], prepumpOn ? COL_BTN_ON : COL_BTN_OFF);
             lv_obj_set_style_bg_opa(btns[s][BTN_FEED], outputsLocked ? LV_OPA_50 : LV_OPA_COVER, 0);
@@ -1031,6 +1489,7 @@ static void update_all_button_visuals()
     update_spinner_state();
     update_alarm_indicators();
     update_flow_sensor_selector_panel();
+    update_production_screen_visuals();
 }
 
 
@@ -1113,6 +1572,94 @@ static void fault_reset_cb(lv_event_t *e)
 }
 
 // --------------------------------------------------
+// PRODUCTION SCREEN EVENTS
+// --------------------------------------------------
+static void prod_enable_cb(lv_event_t *e)
+{
+    (void)e;
+    autoProductionEnabled = !autoProductionEnabled;
+    update_production_screen_visuals();
+}
+
+static void prod_start_cb(lv_event_t *e)
+{
+    (void)e;
+
+    // Se già attivo, il bottone diventa STOP AUTO:
+    // annulla solo l'automatismo, senza spegnere la macchina
+    if (autoProductionActive) {
+        debug_log("AUTO STOP BY USER");
+        autoProductionActive = false;
+        update_production_screen_visuals();
+        return;
+    }
+
+    // Per partire davvero servono:
+    // 1) funzione abilitata
+    // 2) HP pump accesa
+    if (!autoProductionEnabled) {
+        return;
+    }
+
+    if (!hppumpOn) {
+        return;
+    }
+
+    if (autoProductionModeTime) {
+        autoProductionStartRuntimeSec = hppumpRuntimeSec;
+        autoProductionTargetRuntimeSec = hppumpRuntimeSec + ((uint32_t)autoProductionTimeHours * 3600UL);
+        debug_logf("AUTO START TIME %d H", autoProductionTimeHours);
+    } else {
+        autoProductionStartLiters_x10 = totalProducedLiters_x10;
+        autoProductionTargetLiters_x10 = totalProducedLiters_x10 + ((uint32_t)autoProductionTargetLiters * 10UL);
+        debug_logf("AUTO START LITERS %d L", autoProductionTargetLiters);
+    }
+
+    autoProductionActive = true;
+    update_production_screen_visuals();
+}
+
+static void prod_mode_time_cb(lv_event_t *e)
+{
+    (void)e;
+    autoProductionModeTime = true;
+    update_production_screen_visuals();
+}
+
+static void prod_mode_liters_cb(lv_event_t *e)
+{
+    (void)e;
+    autoProductionModeTime = false;
+    update_production_screen_visuals();
+}
+
+static void prod_target_minus_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (autoProductionModeTime) {
+        if (autoProductionTimeHours > 1) autoProductionTimeHours--;
+    } else {
+        if (autoProductionTargetLiters > 50) autoProductionTargetLiters -= 50;
+    }
+
+    update_production_screen_visuals();
+}
+
+static void prod_target_plus_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (autoProductionModeTime) {
+        if (autoProductionTimeHours < 5) autoProductionTimeHours++;
+    } else {
+        if (autoProductionTargetLiters < 500) autoProductionTargetLiters += 50;
+    }
+
+    update_production_screen_visuals();
+}
+
+// --------------------------------------------------
 // RUNTIME / MEMORY
 // --------------------------------------------------
 static void schedule_runtime_save(uint32_t delayMs)
@@ -1136,6 +1683,27 @@ static void process_pending_runtime_save()
     runtimeSaveDueMs = 0;
 }
 
+static void schedule_liters_save(uint32_t delayMs)
+{
+    litersSavePending = true;
+    litersSaveDueMs = millis() + delayMs;
+}
+
+static void process_pending_liters_save()
+{
+    if (!litersSavePending) return;
+
+    unsigned long now = millis();
+    if ((long)(now - litersSaveDueMs) < 0) return;
+
+    if (framReady) {
+        fram_write_u32(FRAM_ADDR_TOTAL_LITERS_X10, totalProducedLiters_x10);
+    }
+
+    litersSavePending = false;
+    litersSaveDueMs = 0;
+}
+
 static void update_hours_label()
 {
     uint32_t totalSec = hppumpRuntimeSec;
@@ -1150,6 +1718,18 @@ static void update_hours_label()
         lv_label_set_text_fmt(lblHoursValue, "%lu h  %02lu m",
                               (unsigned long)hours,
                               (unsigned long)minutes);
+    }
+}
+
+static void update_liters_label()
+{
+    uint32_t litersInt = totalProducedLiters_x10 / 10UL;
+
+    if (litersInt == lastDisplayedLitersInt) return;
+    lastDisplayedLitersInt = litersInt;
+
+    if (lblLitersValue) {
+        lv_label_set_text_fmt(lblLitersValue, "%lu L", (unsigned long)litersInt);
     }
 }
 
@@ -1172,9 +1752,63 @@ static void update_hppump_runtime()
     }
 }
 
+static void update_total_liters()
+{
+    unsigned long now = millis();
+
+    if (lastLitersSecondTick == 0) {
+        lastLitersSecondTick = now;
+        return;
+    }
+
+    if (!hppumpOn) {
+        lastLitersSecondTick = now;
+        return;
+    }
+
+    while ((now - lastLitersSecondTick) >= 1000UL) {
+        // Litri prodotti in 1 secondo
+        float deltaLiters = flowLhTrimmed / 3600.0f;
+
+        // Accumulo frazionario semplice
+        litersFractionAcc += deltaLiters;
+
+        // Ogni volta che raggiungiamo 0.1 L, incrementiamo il contatore persistente
+        while (litersFractionAcc >= 0.1f) {
+            totalProducedLiters_x10++;
+            litersFractionAcc -= 0.1f;
+            schedule_liters_save(60000UL);
+        }
+
+        lastLitersSecondTick += 1000UL;
+    }
+}
+
+static void process_auto_production_logic()
+{
+    if (!autoProductionActive) return;
+    if (!hppumpOn) return;
+
+    if (autoProductionModeTime) {
+        if (hppumpRuntimeSec >= autoProductionTargetRuntimeSec) {
+            debug_log("AUTO TARGET REACHED TIME");
+            safe_shutdown_outputs();
+            autoProductionActive = false;
+        }
+    } else {
+        if (totalProducedLiters_x10 >= autoProductionTargetLiters_x10) {
+            debug_log("AUTO TARGET REACHED LITERS");
+            safe_shutdown_outputs();
+            autoProductionActive = false;
+        }
+    }
+}
+
 static void latch_fault(FaultCode code, const char *title, const char *message)
 {
     if (faultLatched) return;
+
+    debug_logf("FAULT %d: %s", (int)code, title ? title : "UNKNOWN");
 
     faultLatched = true;
     activeFault = code;
@@ -1197,9 +1831,11 @@ static void latch_fault(FaultCode code, const char *title, const char *message)
     flushOn = false;
     tankTestOn = false;
     flushCycleActive = false;
+    autoProductionActive = false;
 
     // stop runtime accumulation
     schedule_runtime_save(200UL);
+    schedule_liters_save(200UL);
 
     // push visual updates
     update_all_button_visuals();
@@ -1320,6 +1956,7 @@ static void process_fault_reset()
         return;
     }
 
+    debug_log("FAULT RESET");
     faultLatched = false;
     activeFault = FAULT_NONE;
     snprintf(faultTitle, sizeof(faultTitle), "SYSTEM OK");
@@ -1333,6 +1970,7 @@ static void controller_logic()
         cmdTankToggle = false;
         if (!faultLatched) {
             tankTestOn = !tankTestOn;
+            debug_log(tankTestOn ? "WATER TO TEST" : "WATER TO TANK");
         }
     }
 
@@ -1340,6 +1978,7 @@ static void controller_logic()
         cmdFeedToggle = false;
         if (!faultLatched) {
             prepumpOn = !prepumpOn;
+            debug_log(prepumpOn ? "FEED ON" : "FEED OFF");
         }
     }
 
@@ -1349,13 +1988,17 @@ static void controller_logic()
         if (!faultLatched) {
             if (!hppumpOn) {
                 hppumpOn = true;
+                debug_log("HP ON");
                 hpStartedMs = millis();
                 lastHppumpSecondTick = millis();
                 runtimeSavePending = false;
                 runtimeSaveDueMs = 0;
             } else {
                 hppumpOn = false;
+                debug_log("HP OFF");
                 schedule_runtime_save(500UL);
+                schedule_liters_save(500UL);
+                autoProductionActive = false;
             }
         }
     }
@@ -1368,9 +2011,11 @@ static void controller_logic()
                 flushCycleActive = true;
                 flushStartMs = millis();
                 flushOn = true;
+                debug_log("FLUSH ON");
             } else {
                 flushCycleActive = false;
                 flushOn = false;
+                debug_log("FLUSH OFF");
             }
         }
     }
@@ -1380,6 +2025,7 @@ static void controller_logic()
         if ((now - flushStartMs) >= (unsigned long)flushTimeSec * 1000UL) {
             flushCycleActive = false;
             flushOn = false;
+            debug_log("FLUSH AUTO OFF");
         }
     }
 
@@ -1428,7 +2074,7 @@ static void create_main_screen()
     lv_obj_set_style_radius(screenMain, 0, 0);
     lv_obj_clear_flag(screenMain, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_header(screenMain, false, true);
+    create_header(screenMain, false, true, NULL, nav_to_settings_cb);
 
     alarmLed = create_alarm_led(screenMain, 20, 72, 22);
     lblAlarmStatus = create_alarm_status_label(screenMain, 52, 74);
@@ -1544,7 +2190,7 @@ static void create_settings_screen()
     lv_obj_set_style_radius(screenSettings, 0, 0);
     lv_obj_clear_flag(screenSettings, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_header(screenSettings, true, false);
+    create_header(screenSettings, true, true, nav_to_main_cb, nav_to_production_cb);
 
     // Central area
     // Header bottom = 60, gap = 15 => y = 75
@@ -1564,26 +2210,44 @@ static void create_settings_screen()
     panelFlush = create_panel(screenSettings, x2, panelY, panelW, panelH);
     panelTrim  = create_panel(screenSettings, x3, panelY, panelW, panelH);
 
-    // ---------------- PANEL 1: HOURS ----------------
-    lv_obj_t *lblHoursTitle = lv_label_create(panelHours);
-    lv_label_set_text(lblHoursTitle, "H.P. PUMP HOURS");
-    lv_obj_set_style_text_color(lblHoursTitle, COL_WHITE, 0);
-    lv_obj_set_style_text_font(lblHoursTitle, &lv_font_montserrat_18, 0);
-    lv_obj_align(lblHoursTitle, LV_ALIGN_TOP_MID, 0, 18);
+// ---------------- PANEL 1: SYSTEM TOTALS ----------------
+lv_obj_t *lblHoursTitle = lv_label_create(panelHours);
+lv_label_set_text(lblHoursTitle, "SYSTEM TOTALS");
+lv_obj_set_style_text_color(lblHoursTitle, COL_WHITE, 0);
+lv_obj_set_style_text_font(lblHoursTitle, &lv_font_montserrat_18, 0);
+lv_obj_align(lblHoursTitle, LV_ALIGN_TOP_MID, 0, 14);
 
-    lblHoursValue = lv_label_create(panelHours);
-    lv_label_set_text(lblHoursValue, "0 h  00 m");
-    lv_obj_set_style_text_color(lblHoursValue, COL_ARC_BLUE, 0);
-    lv_obj_set_style_text_font(lblHoursValue, &lv_font_montserrat_28, 0);
-    lv_obj_align(lblHoursValue, LV_ALIGN_CENTER, 0, -10);
+lv_obj_t *lblHpCaption = lv_label_create(panelHours);
+lv_label_set_text(lblHpCaption, "H.P. PUMP");
+lv_obj_set_style_text_color(lblHpCaption, COL_WHITE, 0);
+lv_obj_set_style_text_font(lblHpCaption, &lv_font_montserrat_14, 0);
+lv_obj_align(lblHpCaption, LV_ALIGN_TOP_MID, 0, 52);
 
-    spinnerHours = lv_spinner_create(panelHours, 1000, 60);
-    lv_obj_set_size(spinnerHours, 42, 42);
-    lv_obj_align(spinnerHours, LV_ALIGN_BOTTOM_MID, 0, -22);
-    lv_obj_set_style_arc_width(spinnerHours, 4, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(spinnerHours, 4, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(spinnerHours, COL_ARC_BG, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(spinnerHours, COL_ARC_BLUE, LV_PART_INDICATOR);
+lblHoursValue = lv_label_create(panelHours);
+lv_label_set_text(lblHoursValue, "0 h  00 m");
+lv_obj_set_style_text_color(lblHoursValue, COL_ARC_BLUE, 0);
+lv_obj_set_style_text_font(lblHoursValue, &lv_font_montserrat_24, 0);
+lv_obj_align(lblHoursValue, LV_ALIGN_TOP_MID, 0, 78);
+
+lv_obj_t *lblLitersCaption = lv_label_create(panelHours);
+lv_label_set_text(lblLitersCaption, "WATER PRODUCED");
+lv_obj_set_style_text_color(lblLitersCaption, COL_WHITE, 0);
+lv_obj_set_style_text_font(lblLitersCaption, &lv_font_montserrat_14, 0);
+lv_obj_align(lblLitersCaption, LV_ALIGN_TOP_MID, 0, 145);
+
+lblLitersValue = lv_label_create(panelHours);
+lv_label_set_text(lblLitersValue, "0 L");
+lv_obj_set_style_text_color(lblLitersValue, COL_ARC_BLUE, 0);
+lv_obj_set_style_text_font(lblLitersValue, &lv_font_montserrat_24, 0);
+lv_obj_align(lblLitersValue, LV_ALIGN_TOP_MID, 0, 171);
+
+spinnerHours = lv_spinner_create(panelHours, 1000, 60);
+lv_obj_set_size(spinnerHours, 42, 42);
+lv_obj_align(spinnerHours, LV_ALIGN_BOTTOM_MID, 0, -18);
+lv_obj_set_style_arc_width(spinnerHours, 4, LV_PART_MAIN);
+lv_obj_set_style_arc_width(spinnerHours, 4, LV_PART_INDICATOR);
+lv_obj_set_style_arc_color(spinnerHours, COL_ARC_BG, LV_PART_MAIN);
+lv_obj_set_style_arc_color(spinnerHours, COL_ARC_BLUE, LV_PART_INDICATOR);
 
     // ---------------- PANEL 2: FLUSH PRESET ----------------
     lv_obj_t *lblFlushTitle = lv_label_create(panelFlush);
@@ -1682,6 +2346,249 @@ static void create_settings_screen()
 }
 
 
+static void create_production_screen()
+{
+    screenProduction = lv_obj_create(NULL);
+    lv_obj_set_size(screenProduction, 800, 480);
+    lv_obj_set_style_bg_color(screenProduction, COL_BG, 0);
+    lv_obj_set_style_bg_opa(screenProduction, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(screenProduction, 0, 0);
+    lv_obj_set_style_radius(screenProduction, 0, 0);
+    lv_obj_clear_flag(screenProduction, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_header(screenProduction, true, true, nav_to_settings_from_production_cb, nav_to_debug_cb);
+
+    // Central area
+    const int panelY = 75;
+    const int panelH = 275;
+    const int gap = 10;
+    const int margin = 10;
+    const int panelW = 253;
+
+    const int x1 = margin;
+    const int x2 = x1 + panelW + gap;
+    const int x3 = x2 + panelW + gap;
+
+    // Nuovo ordine sinistra -> destra:
+    // 1) MODE
+    // 2) TARGET
+    // 3) ENABLE
+    panelProdMode   = create_panel(screenProduction, x1, panelY, panelW, panelH);
+    panelProdTarget = create_panel(screenProduction, x2, panelY, panelW, panelH);
+    panelProdEnable = create_panel(screenProduction, x3, panelY, panelW, panelH);
+
+    // ---------------- PANEL 1: TARGET MODE ----------------
+    lv_obj_t *t1 = lv_label_create(panelProdMode);
+    lv_label_set_text(t1, "TARGET MODE");
+    lv_obj_set_style_text_color(t1, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t1, &lv_font_montserrat_18, 0);
+    lv_obj_align(t1, LV_ALIGN_TOP_MID, 0, 18);
+
+    btnModeTime = lv_btn_create(panelProdMode);
+    lv_obj_set_size(btnModeTime, 92, 52);
+    lv_obj_align(btnModeTime, LV_ALIGN_CENTER, -55, -26);
+    style_button(btnModeTime, COL_BTN_ON);
+    lv_obj_add_event_cb(btnModeTime, prod_mode_time_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lblModeTime = lv_label_create(btnModeTime);
+    lv_label_set_text(lblModeTime, "TIME");
+    lv_obj_set_style_text_color(lblModeTime, COL_WHITE, 0);
+    lv_obj_set_style_text_font(lblModeTime, &lv_font_montserrat_18, 0);
+    lv_obj_center(lblModeTime);
+
+    btnModeLiters = lv_btn_create(panelProdMode);
+    lv_obj_set_size(btnModeLiters, 92, 52);
+    lv_obj_align(btnModeLiters, LV_ALIGN_CENTER, 55, -26);
+    style_button(btnModeLiters, COL_BTN_OFF);
+    lv_obj_add_event_cb(btnModeLiters, prod_mode_liters_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lblModeLiters = lv_label_create(btnModeLiters);
+    lv_label_set_text(lblModeLiters, "LITERS");
+    lv_obj_set_style_text_color(lblModeLiters, COL_WHITE, 0);
+    lv_obj_set_style_text_font(lblModeLiters, &lv_font_montserrat_16, 0);
+    lv_obj_center(lblModeLiters);
+
+    lblProdModeValue = lv_label_create(panelProdMode);
+    lv_label_set_text(lblProdModeValue, "TIME MODE");
+    lv_obj_set_style_text_color(lblProdModeValue, COL_ARC_BLUE, 0);
+    lv_obj_set_style_text_font(lblProdModeValue, &lv_font_montserrat_22, 0);
+    lv_obj_align(lblProdModeValue, LV_ALIGN_BOTTOM_MID, 0, -34);
+
+    // ---------------- PANEL 2: TARGET / COUNTDOWN ----------------
+    lv_obj_t *t2 = lv_label_create(panelProdTarget);
+    lv_label_set_text(t2, "TARGET / COUNTDOWN");
+    lv_obj_set_style_text_color(t2, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t2, &lv_font_montserrat_16, 0);
+    lv_obj_align(t2, LV_ALIGN_TOP_MID, 0, 18);
+
+    // Pulsanti +/-
+    btnTargetMinus = lv_btn_create(panelProdTarget);
+    lv_obj_set_size(btnTargetMinus, 92, 52);
+    lv_obj_align(btnTargetMinus, LV_ALIGN_CENTER, -60, -26);
+    style_button(btnTargetMinus, COL_BTN_OFF);
+    lv_obj_add_event_cb(btnTargetMinus, prod_target_minus_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lblMinus = lv_label_create(btnTargetMinus);
+    lv_label_set_text(lblMinus, "-");
+    lv_obj_set_style_text_font(lblMinus, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblMinus, COL_WHITE, 0);
+    lv_obj_center(lblMinus);
+
+    btnTargetPlus = lv_btn_create(panelProdTarget);
+    lv_obj_set_size(btnTargetPlus, 92, 52);
+    lv_obj_align(btnTargetPlus, LV_ALIGN_CENTER, 60, -26);
+    style_button(btnTargetPlus, COL_BTN_OFF);
+    lv_obj_add_event_cb(btnTargetPlus, prod_target_plus_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lblPlus = lv_label_create(btnTargetPlus);
+    lv_label_set_text(lblPlus, "+");
+    lv_obj_set_style_text_font(lblPlus, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblPlus, COL_WHITE, 0);
+    lv_obj_center(lblPlus);
+
+    lblProdTargetValue = lv_label_create(panelProdTarget);
+    lv_label_set_text(lblProdTargetValue, "1 HOUR");
+    lv_obj_set_style_text_color(lblProdTargetValue, COL_ARC_BLUE, 0);
+    lv_obj_set_style_text_font(lblProdTargetValue, &lv_font_montserrat_24, 0);
+    lv_obj_align(lblProdTargetValue, LV_ALIGN_CENTER, 0, 50);
+
+    lblProdCountdown = lv_label_create(panelProdTarget);
+    lv_label_set_text(lblProdCountdown, "TTG --:--:--");
+    lv_obj_set_style_text_color(lblProdCountdown, COL_WHITE, 0);
+    lv_obj_set_style_text_font(lblProdCountdown, &lv_font_montserrat_18, 0);
+    lv_obj_align(lblProdCountdown, LV_ALIGN_CENTER, 0, 95);
+
+    // ---------------- PANEL 3: AUTO PRODUCTION ----------------
+    lv_obj_t *t3 = lv_label_create(panelProdEnable);
+    lv_label_set_text(t3, "AUTO PRODUCTION");
+    lv_obj_set_style_text_color(t3, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t3, &lv_font_montserrat_18, 0);
+    lv_obj_align(t3, LV_ALIGN_TOP_MID, 0, 18);
+
+    btnProdEnable = lv_btn_create(panelProdEnable);
+    lv_obj_set_size(btnProdEnable, 140, 58);
+    lv_obj_align(btnProdEnable, LV_ALIGN_CENTER, 0, -18);
+    style_button(btnProdEnable, COL_BTN_OFF);
+    lv_obj_add_event_cb(btnProdEnable, prod_enable_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lblEnableBtn = lv_label_create(btnProdEnable);
+    lv_label_set_text(lblEnableBtn, "ON / OFF");
+    lv_obj_set_style_text_color(lblEnableBtn, COL_WHITE, 0);
+    lv_obj_set_style_text_font(lblEnableBtn, &lv_font_montserrat_20, 0);
+    lv_obj_center(lblEnableBtn);
+
+lblProdEnableValue = lv_label_create(panelProdEnable);
+lv_label_set_text(lblProdEnableValue, "DISABLED");
+lv_obj_set_style_text_color(lblProdEnableValue, COL_ARC_BLUE, 0);
+lv_obj_set_style_text_font(lblProdEnableValue, &lv_font_montserrat_24, 0);
+lv_obj_align(lblProdEnableValue, LV_ALIGN_CENTER, 0, 34);
+
+btnProdStart = lv_btn_create(panelProdEnable);
+lv_obj_set_size(btnProdStart, 140, 52);
+lv_obj_align(btnProdStart, LV_ALIGN_BOTTOM_MID, 0, -26);
+style_button(btnProdStart, COL_BTN_OFF);
+lv_obj_add_event_cb(btnProdStart, prod_start_cb, LV_EVENT_CLICKED, NULL);
+
+lv_obj_t *lblStartBtn = lv_label_create(btnProdStart);
+lv_label_set_text(lblStartBtn, "START AUTO");
+lv_obj_set_style_text_color(lblStartBtn, COL_WHITE, 0);
+lv_obj_set_style_text_font(lblStartBtn, &lv_font_montserrat_18, 0);
+lv_obj_center(lblStartBtn);
+
+    update_production_screen_visuals();
+
+    create_bottom_buttons_for_screen(screenProduction, 2);
+}
+
+static void create_debug_screen()
+{
+    screenDebug = lv_obj_create(NULL);
+    lv_obj_set_size(screenDebug, 800, 700);
+    lv_obj_set_style_bg_color(screenDebug, COL_BG, 0);
+    lv_obj_set_style_bg_opa(screenDebug, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(screenDebug, 0, 0);
+    lv_obj_set_style_radius(screenDebug, 0, 0);
+
+
+    create_header(screenDebug, true, false, nav_to_production_from_debug_cb, NULL);
+
+    const int panelY = 75;
+    const int panelH = 275;
+    const int gap = 10;
+    const int margin = 10;
+    const int panelW = 253;
+
+    const int x1 = margin;
+    const int x2 = x1 + panelW + gap;
+    const int x3 = x2 + panelW + gap;
+
+    panelDebugSystem = create_panel(screenDebug, x1, panelY, panelW, panelH);
+    panelDebugMemory = create_panel(screenDebug, x2, panelY, panelW, panelH);
+    panelDebugEvents = create_panel(screenDebug, x3, panelY, panelW, panelH);
+
+    const int bootPanelY = panelY + panelH + 15;
+const int bootPanelH = 280;
+
+panelBootLog = create_panel(screenDebug, 10, bootPanelY, 780, bootPanelH);
+
+    // PANEL 1
+    lv_obj_t *t1 = lv_label_create(panelDebugSystem);
+    lv_label_set_text(t1, "SYSTEM");
+    lv_obj_set_style_text_color(t1, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t1, &lv_font_montserrat_18, 0);
+    lv_obj_align(t1, LV_ALIGN_TOP_MID, 0, 18);
+
+    lblDebugSystemValue = lv_label_create(panelDebugSystem);
+    lv_obj_set_width(lblDebugSystemValue, 225);
+    lv_obj_set_style_text_color(lblDebugSystemValue, COL_SOFT, 0);
+    lv_obj_set_style_text_font(lblDebugSystemValue, &lv_font_montserrat_16, 0);
+    lv_obj_align(lblDebugSystemValue, LV_ALIGN_TOP_LEFT, 14, 56);
+
+    // PANEL 2
+    lv_obj_t *t2 = lv_label_create(panelDebugMemory);
+    lv_label_set_text(t2, "MEMORY / STATUS");
+    lv_obj_set_style_text_color(t2, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t2, &lv_font_montserrat_18, 0);
+    lv_obj_align(t2, LV_ALIGN_TOP_MID, 0, 18);
+
+    lblDebugMemoryValue = lv_label_create(panelDebugMemory);
+    lv_obj_set_width(lblDebugMemoryValue, 225);
+    lv_obj_set_style_text_color(lblDebugMemoryValue, COL_SOFT, 0);
+    lv_obj_set_style_text_font(lblDebugMemoryValue, &lv_font_montserrat_16, 0);
+    lv_obj_align(lblDebugMemoryValue, LV_ALIGN_TOP_LEFT, 14, 56);
+
+    // PANEL 3
+    lv_obj_t *t3 = lv_label_create(panelDebugEvents);
+    lv_label_set_text(t3, "RECENT EVENTS");
+    lv_obj_set_style_text_color(t3, COL_WHITE, 0);
+    lv_obj_set_style_text_font(t3, &lv_font_montserrat_18, 0);
+    lv_obj_align(t3, LV_ALIGN_TOP_MID, 0, 18);
+
+    lblDebugEventsValue = lv_label_create(panelDebugEvents);
+    lv_obj_set_width(lblDebugEventsValue, 225);
+    lv_obj_set_style_text_color(lblDebugEventsValue, COL_SOFT, 0);
+    lv_obj_set_style_text_font(lblDebugEventsValue, &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(lblDebugEventsValue, LV_LABEL_LONG_WRAP);
+    lv_obj_align(lblDebugEventsValue, LV_ALIGN_TOP_LEFT, 14, 56);
+
+    // BOOT LOG PANEL
+lv_obj_t *t4 = lv_label_create(panelBootLog);
+lv_label_set_text(t4, "BOOT LOG");
+lv_obj_set_style_text_color(t4, COL_WHITE, 0);
+lv_obj_set_style_text_font(t4, &lv_font_montserrat_18, 0);
+lv_obj_align(t4, LV_ALIGN_TOP_MID, 0, 18);
+
+lblBootLogValue = lv_label_create(panelBootLog);
+lv_obj_set_width(lblBootLogValue, 750);
+lv_obj_set_style_text_color(lblBootLogValue, COL_SOFT, 0);
+lv_obj_set_style_text_font(lblBootLogValue, &lv_font_montserrat_14, 0);
+lv_label_set_long_mode(lblBootLogValue, LV_LABEL_LONG_WRAP);
+lv_obj_align(lblBootLogValue, LV_ALIGN_TOP_LEFT, 14, 56);
+
+    
+    update_debug_screen();
+}
+
 static void create_alarm_screen()
 {
     screenAlarm = lv_obj_create(NULL);
@@ -1754,11 +2661,102 @@ static void show_settings_screen()
     update_alarm_indicators();
 }
 
+static void show_production_screen()
+{
+    if (!screenProduction) return;
+    lv_scr_load(screenProduction);
+}
+
+static void show_debug_screen()
+{
+    if (!screenDebug) return;
+    lv_scr_load(screenDebug);
+}
+
 static void show_alarm_screen()
 {
     if (lblFaultTitle) lv_label_set_text(lblFaultTitle, faultTitle);
     if (lblFaultMessage) lv_label_set_text(lblFaultMessage, faultMessage);
     lv_scr_load(screenAlarm);
+}
+
+static void update_debug_screen()
+{
+    if (lblDebugSystemValue) {
+        lv_label_set_text_fmt(
+            lblDebugSystemValue,
+            "SW VERSION: %s\n"
+            "RESET NOW: %s (%d)\n"
+            "RESET PREV: %s (%lu)\n"
+            "BOOT COUNT: %lu\n"
+            "LAST UPTIME: %lu s",
+            SW_VERSION,
+            reset_reason_to_string(esp_reset_reason()),
+            (int)esp_reset_reason(),
+            reset_reason_to_string((esp_reset_reason_t)debugLastResetReason),
+            (unsigned long)debugLastResetReason,
+            (unsigned long)debugBootCount,
+            (unsigned long)debugLastUptimeSec
+        );
+    }
+
+    if (lblDebugMemoryValue) {
+        lv_label_set_text_fmt(
+            lblDebugMemoryValue,
+            "HEAP: %lu\n"
+            "PSRAM: %lu\n"
+            "HP RUNTIME: %lu s\n"
+            "TOTAL LITERS: %lu L",
+            (unsigned long)ESP.getFreeHeap(),
+            (unsigned long)ESP.getFreePsram(),
+            (unsigned long)hppumpRuntimeSec,
+            (unsigned long)(totalProducedLiters_x10 / 10UL)
+        );
+    }
+
+    if (lblDebugEventsValue) {
+        char buf[1200];
+        buf[0] = '\0';
+
+        int count = debugLogWrapped ? DEBUG_LOG_LINES : debugLogWriteIndex;
+        int start = debugLogWrapped ? debugLogWriteIndex : 0;
+
+        for (int i = 0; i < count; i++) {
+            int idx = (start + i) % DEBUG_LOG_LINES;
+            if (debugLogBuffer[idx][0] == '\0') continue;
+
+            strncat(buf, debugLogBuffer[idx], sizeof(buf) - strlen(buf) - 1);
+            strncat(buf, "\n", sizeof(buf) - strlen(buf) - 1);
+        }
+
+        if (buf[0] == '\0') {
+            snprintf(buf, sizeof(buf), "NO EVENTS YET");
+        }
+
+        lv_label_set_text(lblDebugEventsValue, buf);
+    }
+
+    if (lblBootLogValue) {
+    char buf[3000];
+    buf[0] = '\0';
+
+    int count = bootLogWrapped ? BOOT_LOG_LINES : bootLogWriteIndex;
+    int start = bootLogWrapped ? bootLogWriteIndex : 0;
+
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % BOOT_LOG_LINES;
+        if (bootLogBuffer[idx][0] == '\0') continue;
+
+        strncat(buf, bootLogBuffer[idx], sizeof(buf) - strlen(buf) - 1);
+        strncat(buf, "\n", sizeof(buf) - strlen(buf) - 1);
+    }
+
+    if (buf[0] == '\0') {
+        snprintf(buf, sizeof(buf), "NO BOOT LOG YET");
+    }
+
+    lv_label_set_text(lblBootLogValue, buf);
+}
 }
 
 // --------------------------------------------------
@@ -1893,7 +2891,9 @@ static void create_ui()
 {
     create_main_screen();
     create_settings_screen();
+    create_production_screen();
     create_alarm_screen();
+    create_debug_screen();
     update_all_button_visuals();
     update_hours_label();
     update_flow_trim_panel();
@@ -1930,6 +2930,9 @@ static void poll_sensors_round_robin()
 void setup()
 {
     Serial.begin(115200);
+    delay(200);
+
+    boot_log("BOOT START");
 
     // --- V5 SAFE START (C3 connected) ---
     
@@ -1956,7 +2959,9 @@ void setup()
 #endif
 
     board->begin();
+    boot_log("BOARD BEGIN OK");
     lvgl_port_init(board->getLCD(), board->getTouch());
+    boot_log("LVGL INIT OK");
 
 // SPLASH SCREEN
 lvgl_port_lock(-1);
@@ -1969,6 +2974,7 @@ delay(2000);
 // UI vera
 lvgl_port_lock(-1);
 create_ui();
+boot_log("UI CREATED");
 lvgl_port_unlock();
 
     framInitEarliestMs = millis() + 2000UL;
@@ -1980,22 +2986,53 @@ void loop()
     update_hppump_runtime();
     fram_try_init_deferred();
 
+    //poll_sensors_round_robin();
+
+static unsigned long lastSensorPollMs = 0;
+unsigned long nowSensor = millis();
+
+if ((nowSensor - lastSensorPollMs) >= 250UL) {
+    lastSensorPollMs = nowSensor;
     poll_sensors_round_robin();
+}
+
+    update_total_liters();
+    process_auto_production_logic();
 
     apply_outputs();
     process_pending_runtime_save();
+    process_pending_liters_save();
+    // debug_save_heartbeat_persistent();   // TEMP disabled during I2C/touch stability tests
 
-    lvgl_port_lock(-1);
-    update_flow_gauge();
-    update_pressure_gauge();
-    update_tds_gauge();
-    update_hours_label();
-    update_all_button_visuals();
+    // --------------------------------------------------
+    // GUI update throttling
+    // Update LVGL objects only 5 times per second
+    // --------------------------------------------------
+    static unsigned long lastGuiUpdateMs = 0;
+    unsigned long now = millis();
 
-    if (faultLatched && lv_scr_act() != screenAlarm) {
-        show_alarm_screen();
+    if ((now - lastGuiUpdateMs) >= 200UL) {
+        lastGuiUpdateMs = now;
+
+        lvgl_port_lock(-1);
+
+        update_flow_gauge();
+        update_pressure_gauge();
+        update_tds_gauge();
+        update_hours_label();
+        update_liters_label();
+        update_all_button_visuals();
+
+        if (lv_scr_act() == screenDebug) {
+            update_debug_screen();
+        }
+
+        if (faultLatched && lv_scr_act() != screenAlarm) {
+            show_alarm_screen();
+        }
+
+        lvgl_port_unlock();
     }
-    lvgl_port_unlock();
 
     delay(10);
 }
